@@ -10,12 +10,27 @@ Browser ──HTTPS──> CloudFront (OAC) ──> S3 (private bucket)
    └──GET /current?q=...──> API Gateway (HTTP API) ──> Lambda ──> WeatherAPI
 ```
 
+## Configuration files
+
+| File | Purpose | Committed? |
+| --- | --- | --- |
+| `.env` | Local/deploy secrets: `WEATHER_API_KEY`, `WEATHER_PROXY_URL`, `WEATHER_DEFAULT_CITY` | **No** (gitignored) |
+| `.env.example` | Template for `.env` | Yes |
+| `config.js` | Runtime config loaded by the browser; **generated** from `.env` | **No** (gitignored) |
+| `scripts/generate-config.mjs` | Reads `.env` and writes `config.js` | Yes |
+
+`config.js` always contains either the API key (local direct mode) or the proxy URL (production mode), never both:
+
+- `WEATHER_PROXY_URL` empty → `config.js` contains `apiKey` (local development only).
+- `WEATHER_PROXY_URL` set → `config.js` contains `proxyUrl` and an empty `apiKey`.
+
 ---
 
 ## 0. Prerequisites
 
 - An AWS account and an IAM user/role that can manage S3, CloudFront, ACM, Route 53, Lambda, API Gateway, CloudFormation and IAM.
 - AWS CLI v2 configured for that account (`aws configure`).
+- Node.js 18+ (used to generate `config.js`).
 - AWS SAM CLI (only if you deploy the proxy).
 - A WeatherAPI key.
 
@@ -24,17 +39,36 @@ winget install Amazon.AWSCLI
 winget install Amazon.SAM-CLI
 aws --version
 sam --version
+node --version
 aws sts get-caller-identity   # confirms which account you're deploying to
 ```
 
 > **Important:** rotate your WeatherAPI key first. The old key was committed in `index.js`, so treat it as public. Create a new key in the WeatherAPI dashboard.
 
-**Local test before deploying:**
+Create your local environment file:
 
 ```powershell
+Copy-Item .env.example .env
+notepad .env
+```
+
+```dotenv
+WEATHER_API_KEY=your-new-weather-api-key
+WEATHER_PROXY_URL=
+WEATHER_DEFAULT_CITY=Mumbai
+```
+
+`.env` and the generated `config.js` are in `.gitignore`. Never commit either one while it contains a real key.
+
+**Local test:**
+
+```powershell
+node scripts/generate-config.mjs
 python -m http.server 8000
 # open http://localhost:8000 (geolocation works on localhost)
 ```
+
+`generate-config.mjs` refuses to run if both `WEATHER_API_KEY` and `WEATHER_PROXY_URL` are empty.
 
 ---
 
@@ -104,29 +138,17 @@ Note the distribution domain (`dxxxxxxxxxxxxx.cloudfront.net`) and distribution 
 
 ---
 
-## 3. Deploy the API proxy (recommended)
+## 3. Deploy the API proxy
 
-The proxy takes the browser's `?q=` and calls WeatherAPI with the server-side key.
+The proxy reads `WEATHER_API_KEY` from `.env` and passes it to Lambda as an environment variable.
 
 ```powershell
-cd backend
-sam build
-sam deploy --guided
+.\backend\deploy.ps1 -AllowedOrigin "https://dxxxxxxxxxxxxx.cloudfront.net"
 ```
 
-Answers for `sam deploy --guided`:
+Optional parameters: `-StackName weather-proxy`, `-Region us-east-1`, `-EnvFile .env`.
 
-| Prompt | Value |
-| --- | --- |
-| Stack name | `weather-proxy` |
-| AWS Region | `us-east-1` (or your region) |
-| Parameter `WeatherApiKey` | your new WeatherAPI key |
-| Parameter `AllowedOrigin` | `https://dxxxxxxxxxxxxx.cloudfront.net` |
-| Confirm changeset | `Y` |
-| Allow SAM CLI IAM role creation | `Y` |
-| Save arguments to config file | `Y` |
-
-The stack output `ProxyUrl` looks like:
+The script runs `sam build` and `sam deploy --resolve-s3 --capabilities CAPABILITY_IAM`, then prints the stack outputs. The `ProxyUrl` output looks like:
 
 ```
 https://abc123def4.execute-api.us-east-1.amazonaws.com/current
@@ -138,28 +160,42 @@ Test it:
 Invoke-RestMethod "https://abc123def4.execute-api.us-east-1.amazonaws.com/current?q=London"
 ```
 
-If you later add a custom domain, redeploy with `AllowedOrigin` set to `https://weather.example.com` and then update the browser cache (see step 7).
+If you prefer the interactive flow:
+
+```powershell
+cd backend
+sam build
+sam deploy --guided
+```
+
+Enter `WeatherApiKey` from `.env`, set `AllowedOrigin` to the CloudFront domain, and allow SAM to create the IAM role. Do not commit `backend/samconfig.toml` if it stores the key.
 
 ---
 
 ## 4. Point the frontend at the proxy
 
-Edit `config.js`:
+Add the proxy URL to `.env`:
 
-```js
-window.WEATHER_CONFIG = {
-    apiKey: "",
-    proxyUrl: "https://abc123def4.execute-api.us-east-1.amazonaws.com/current",
-    defaultCity: "Mumbai",
-};
+```dotenv
+WEATHER_API_KEY=your-new-weather-api-key
+WEATHER_PROXY_URL=https://abc123def4.execute-api.us-east-1.amazonaws.com/current
+WEATHER_DEFAULT_CITY=Mumbai
 ```
 
-Only the public proxy URL ships to the browser. Verify no key remains:
+Regenerate the browser config:
 
 ```powershell
-Select-String -Path *.js,*.html -Pattern "apiKey\s*:\s*\"[^\"]+\""
-# should not match, or only match an empty apiKey
+node scripts/generate-config.mjs
 ```
+
+`config.js` now contains the proxy URL and an empty `apiKey`. Verify that no key is left in browser assets:
+
+```powershell
+Select-String -Path config.js -Pattern "apiKey"
+# expected: apiKey: ""
+```
+
+The key itself stays in `.env` only, because `backend/deploy.ps1` needs it for future proxy updates.
 
 ---
 
@@ -168,30 +204,24 @@ Select-String -Path *.js,*.html -Pattern "apiKey\s*:\s*\"[^\"]+\""
 From the project root (the folder containing `index.html`):
 
 ```powershell
-$BUCKET = "weather-app-1234567890"
-$DIST_ID = "EXXXXXXXXXXXXX"
-
-aws s3 sync . "s3://$BUCKET" --delete `
-  --exclude "backend/*" `
-  --exclude ".git/*" `
-  --exclude "*.md" `
-  --exclude "deploy.ps1"
-
-aws cloudfront create-invalidation --distribution-id $DIST_ID --paths "/*"
+.\deploy.ps1 -Bucket weather-app-1234567890 -DistributionId EXXXXXXXXXXXXX
 ```
 
-Or use the included script:
+The script:
 
-```powershell
-.\deploy.ps1 -Bucket $BUCKET -DistributionId $DIST_ID
-```
+1. Regenerates `config.js` from `.env`.
+2. Syncs the site to S3 (excludes `.env`, `backend/`, `scripts/`, docs and the script itself).
+3. Invalidates `/*` in CloudFront.
+
+To use a different env file: `.\deploy.ps1 -Bucket ... -DistributionId ... -EnvFile .env.production`.
 
 Open `https://dxxxxxxxxxxxxx.cloudfront.net` and check:
 
 - The card loads with the default city.
 - Searching a city updates the card.
-- The `config.js` response contains only the proxy URL.
 - An invalid city shows an error message instead of a silent failure.
+- `https://dxxxxxxxxxxxxx.cloudfront.net/config.js` contains the proxy URL and no API key.
+- `https://dxxxxxxxxxxxxx.cloudfront.net/.env` returns `403`.
 
 ---
 
@@ -201,42 +231,62 @@ Open `https://dxxxxxxxxxxxxx.cloudfront.net` and check:
 2. Validate it with DNS (Route 53 can add the validation records automatically).
 3. CloudFront → your distribution → **Edit** → add the alternate domain name `weather.example.com` and select the certificate.
 4. Route 53 → your hosted zone → create an **A** record (alias) for `weather.example.com` pointing to the CloudFront distribution. Do the same for **AAAA** if you want IPv6.
-5. Wait for the distribution to redeploy, then update the proxy's `AllowedOrigin` to `https://weather.example.com` and redeploy the stack.
+5. Wait for the distribution to redeploy, then update the proxy so CORS allows the new origin:
+
+```powershell
+.\backend\deploy.ps1 -AllowedOrigin "https://weather.example.com"
+```
 
 ---
 
 ## 7. Deploying updates
 
 ```powershell
+# Frontend (regenerates config.js, uploads, invalidates)
 .\deploy.ps1 -Bucket weather-app-1234567890 -DistributionId EXXXXXXXXXXXXX
 ```
 
 `index.html` and `config.js` change often, so invalidating `/*` after each deploy is the simplest safe default. If you want fewer invalidations, add a separate cache behavior for `config.js` with a short TTL instead.
 
-If you only changed Lambda code:
+Backend only:
 
 ```powershell
-cd backend
-sam build
-sam deploy
+.\backend\deploy.ps1 -AllowedOrigin "https://dxxxxxxxxxxxxx.cloudfront.net"
 ```
+
+After changing `WEATHER_API_KEY`, redeploy the proxy, then run the frontend deploy (the key is not part of the browser assets in proxy mode, so the second step is only needed if other config changed).
 
 ---
 
 ## 8. Optional CI/CD (GitHub Actions)
 
 1. Create an IAM role trusted by GitHub OIDC (no long-lived keys) with S3 + CloudFront invalidation permissions.
-2. Add `AWS_ROLE_ARN`, `BUCKET` and `DISTRIBUTION_ID` as repository variables.
-3. On push to `main`, run `aws s3 sync` and `aws cloudfront create-invalidation`.
+2. Add `AWS_ROLE_ARN`, `BUCKET`, `DISTRIBUTION_ID` and `WEATHER_API_KEY` as repository secrets/variables.
+3. In the workflow, recreate `.env` from secrets before deploying:
 
-Do not commit `config.js` with a real API key. With the proxy in place it stays empty, so committing it is safe.
+```yaml
+- name: Write .env
+  shell: bash
+  run: |
+    cat > .env <<EOF
+    WEATHER_API_KEY=${{ secrets.WEATHER_API_KEY }}
+    WEATHER_PROXY_URL=${{ vars.WEATHER_PROXY_URL }}
+    WEATHER_DEFAULT_CITY=Mumbai
+    EOF
+- name: Deploy
+  shell: pwsh
+  run: .\deploy.ps1 -Bucket $env:BUCKET -DistributionId $env:DISTRIBUTION_ID
+```
+
+Do not commit `.env` or `config.js`. In proxy mode `config.js` contains no secrets; it is gitignored only because it is generated.
 
 ---
 
 ## 9. Cost and security notes
 
 - **Cost:** S3 storage and CloudFront traffic for a small site are typically free-tier or a few cents per month. Lambda + HTTP API fit comfortably in the free tier. Invalidation requests beyond 1,000 paths/month are charged.
-- **Secrets:** keep the WeatherAPI key only in the Lambda environment (or better, SSM Parameter Store/Secrets Manager). Never in `config.js` or the S3 bucket.
+- **Secrets:** the WeatherAPI key lives in `.env` locally and in the Lambda environment after deployment. For stronger setups, store it in SSM Parameter Store or Secrets Manager and read it in the Lambda at runtime.
+- **Local files:** `.env` and `config.js` are gitignored. Never commit them with real values, and rotate the key if either leaks.
 - **CORS:** `AllowedOrigin` should be your exact site origin, not `*`, in production.
 - **Rate limiting:** enable an API Gateway usage plan/throttle if the site is public, and watch WeatherAPI quota.
 - **Monitoring:** add an AWS Budgets alarm and optionally CloudWatch alarms for Lambda errors.
