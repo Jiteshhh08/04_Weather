@@ -1,0 +1,42 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: Weather API proxy that keeps the WeatherAPI key server-side.
+
+Parameters:
+  WeatherApiKey:
+    Type: String
+    NoEcho: true
+    Description: WeatherAPI.com API key
+
+  AllowedOrigin:
+    Type: String
+    Default: "*"
+    Description: Origin allowed to call the proxy (use your site URL in production)
+
+Globals:
+  Function:
+    Runtime: nodejs22.x
+    Timeout: 10
+    MemorySize: 128
+
+Resources:
+  WeatherProxyFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: lambda/
+      Handler: index.handler
+      Environment:
+        Variables:
+          WEATHERAPI_KEY: !Ref WeatherApiKey
+          ALLOWED_ORIGIN: !Ref AllowedOrigin
+      Events:
+        CurrentWeather:
+          Type: HttpApi
+          Properties:
+            Path: /current
+            Method: GET
+
+Outputs:
+  ProxyUrl:
+    Description: Set this as proxyUrl in config.js
+    Value: !Sub "https://${ServerlessHttpApi}.execute-api.${AWS::Region}.amazonaws.com/current"
